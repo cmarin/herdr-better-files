@@ -85,15 +85,16 @@ async function directory(path, on) {
     // Links keep directory attributes even when dangling; check their target.
     // Other reparse points (OneDrive's folders) have no LinkType and are folders.
     // PowerShell reads curly single quotes as quotes too, so they're doubled like '.
-    const r = await exec("powershell", ["-NoProfile", "-Command", "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & { param($p) @(Get-ChildItem -LiteralPath $p -Force -ErrorAction Stop | Where-Object Name -ne '.git' | Select-Object -First 501 | ForEach-Object { @{ name=$_.Name; mtime=([DateTimeOffset]$_.LastWriteTimeUtc).ToUnixTimeSeconds(); dir=($_.PSIsContainer -and (-not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not $_.LinkType -or ($_.Target -and [IO.Directory]::Exists(([IO.Path]::Combine([IO.Path]::GetDirectoryName($_.FullName), $_.Target[0])))))) } }) | ConvertTo-Json -Compress } '" + path.replace(/['‘’‚‛]/g, "$&$&") + "'"], { on });
+    const r = await exec("powershell", ["-NoProfile", "-Command", "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & { param($p) @(Get-ChildItem -LiteralPath $p -Force -ErrorAction Stop | Where-Object Name -ne '.git' | Select-Object -First 5001 | ForEach-Object { @{ name=$_.Name; mtime=([DateTimeOffset]$_.LastWriteTimeUtc).ToUnixTimeSeconds(); dir=($_.PSIsContainer -and (-not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not $_.LinkType -or ($_.Target -and [IO.Directory]::Exists(([IO.Path]::Combine([IO.Path]::GetDirectoryName($_.FullName), $_.Target[0])))))) } }) | ConvertTo-Json -Compress } '" + path.replace(/['‘’‚‛]/g, "$&$&") + "'"], { on });
     if (r.code !== 0) throw new Error(r.stderr || "Cannot list this folder");
     const result = JSON.parse(r.stdout || "[]");
     return Array.isArray(result) ? result : [result];
   };
   if (!on && window()?.platform === "windows") return windowsDirectory();
-  // Lists kind/name pairs, then a "t" field, then one modification time per entry from a single stat call
-  // (GNU stat -c on Linux, BSD stat -f on macOS). The times are dropped if their count does not match.
-  const script = 'dir=$1; shift; n=0; for p in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do [ -e "$p" ] || [ -L "$p" ] || continue; name=${p##*/}; [ "$name" = .git ] && continue; if [ -d "$p" ]; then kind=d; else kind=f; fi; printf "%s\\0%s\\0" "$kind" "$name"; set -- "$@" "$p"; n=$((n+1)); [ "$n" -gt 500 ] && break; done; test -d "$dir" || exit 1; printf "t\\0"; [ $# -eq 0 ] && exit 0; if stat -c %Y / >/dev/null 2>&1; then stat -c %Y -- "$@" 2>/dev/null; else stat -f %m -- "$@" 2>/dev/null; fi; exit 0';
+  // Lists kind/name pairs (at most 5,001), then a "t" field, then one modification time per entry from a single
+  // stat call (GNU stat -c on Linux, BSD stat -f on macOS). If that call fails (a file removed mid-listing), each
+  // entry is stat'ed alone and a missing one gets 0. The times are dropped only if their count does not match.
+  const script = 'dir=$1; shift; n=0; for p in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do [ -e "$p" ] || [ -L "$p" ] || continue; name=${p##*/}; [ "$name" = .git ] && continue; if [ -d "$p" ]; then kind=d; else kind=f; fi; printf "%s\\0%s\\0" "$kind" "$name"; set -- "$@" "$p"; n=$((n+1)); [ "$n" -gt 5000 ] && break; done; test -d "$dir" || exit 1; printf "t\\0"; [ $# -eq 0 ] && exit 0; if stat -c %Y / >/dev/null 2>&1; then s() { stat -c %Y -- "$@"; }; else s() { stat -f %m -- "$@"; }; fi; if out=$(s "$@" 2>/dev/null); then printf "%s\\n" "$out"; else for p; do s "$p" 2>/dev/null || echo 0; done; fi; exit 0';
   let r;
   try { r = await exec("sh", ["-c", script, "files", path], { on }); }
   catch (e) {
@@ -136,8 +137,11 @@ export default class Files extends View {
     const { on, cwd: root } = context;
     const entries = await directory(path ? `${root}/${path}` : root, on);
     if (!this.current(context) || (path && !this.folders.has(path))) return;
-    const used = [...this.entries.entries()].filter(([p]) => p !== path).reduce((n, [, e]) => n + e.length, 0);
-    this.entries.set(path, entries.slice(0, Math.max(0, Math.min(PER_FOLDER, TOTAL - used))));
+    // The whole listing (up to 5,000) is kept so that sorting by time sees every entry; `cap` is how many of
+    // the sorted entries the tree shows (500 per folder, 5,000 in total).
+    const used = [...this.entries.entries()].filter(([p]) => p !== path).reduce((n, [, e]) => n + e.cap, 0);
+    entries.cap = Math.max(0, Math.min(PER_FOLDER, TOTAL - used, entries.length));
+    this.entries.set(path, entries);
     if (entries.length > PER_FOLDER || used + entries.length > TOTAL) this.limited = true;
   }
 
@@ -250,7 +254,7 @@ export default class Files extends View {
     const hit = this.sortCache.get(list);
     if (hit?.sort === this.sort) return hit.rows;
     const cmp = SORTS[this.sort].cmp;
-    const rows = [...list].sort((a, b) => Number(b.dir) - Number(a.dir) || cmp(a, b));
+    const rows = [...list].sort((a, b) => Number(b.dir) - Number(a.dir) || cmp(a, b)).slice(0, list.cap ?? PER_FOLDER);
     this.sortCache.set(list, { sort: this.sort, rows });
     return rows;
   }
