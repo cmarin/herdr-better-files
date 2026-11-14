@@ -1,9 +1,10 @@
 // Better Files: a lazy file browser for the focused pane's folder, with bounded read-only previews.
 // Markdown files render as formatted text, with a header button that flips to the source.
 // A header button sorts the tree by name or by modification time. Right-click a row to type its path into the terminal.
-// Modified from Herdr's shipped "files" mod (v0.1.15, Apache-2.0): adds the Markdown preview, sorting and path insertion.
+// A search field filters every file under the folder, not only the expanded ones.
+// Modified from Herdr's shipped "files" mod (v0.1.15, Apache-2.0): adds the Markdown preview, sorting, path insertion and search.
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, Editor, EditorState, TextView } from "gpui-base";
+import { v_flex, h_flex, Editor, EditorState, TextView, InputState, Input } from "gpui-base";
 import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window, run } from "herdr";
 
 function location() {
@@ -78,6 +79,44 @@ const CLIP = [
 const clipSwap = (text) => exec("sh", ["-c", 'd=$(mktemp -d "${TMPDIR:-/tmp}/herdr-better-files.XXXXXX") || exit 1; osascript -l JavaScript -e "$1" swap "$d" "$2" >/dev/null || { osascript -l JavaScript -e "$1" restore "$d" "" >/dev/null; exit 1; }; printf %s "$d"', "clip", CLIP, text]);
 const clipRestore = (dir) => exec("sh", ["-c", 'osascript -l JavaScript -e "$1" restore "$2" "" >/dev/null', "clip", CLIP, dir]);
 const storedSort = () => { try { return localStorage.getItem("sort"); } catch { return null; } };
+// Search reads at most this many paths and shows at most this many matches.
+const INDEX_LIMIT = 50000, RESULTS = 200;
+
+// Every file under `root`, as paths relative to it. In a git work tree: tracked and untracked files, without
+// ignored ones (node_modules, build output). Elsewhere: `find`, skipping .git and node_modules folders.
+async function fileIndex(root, on) {
+  const git = await exec("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], { cwd: root, on }).catch(() => null);
+  let paths;
+  if (git?.code === 0) paths = git.stdout.split("\0");
+  else if (!on && window()?.platform === "windows") {
+    const r = await exec("powershell", ["-NoProfile", "-Command", "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & { param($p) Get-ChildItem -LiteralPath $p -Recurse -File -Force -Name -ErrorAction SilentlyContinue | Where-Object { $_ -notmatch '(^|\\\\)(\\.git|node_modules)(\\\\|$)' } | Select-Object -First " + INDEX_LIMIT + " } '" + root.replace(/['‘’‚‛]/g, "$&$&") + "'"], { on });
+    if (r.code !== 0) throw new Error(r.stderr || "Cannot search this folder");
+    paths = r.stdout.split(/\r?\n/).map(p => p.replace(/\\/g, "/"));
+  } else {
+    const r = await exec("sh", ["-c", 'cd "$1" && find . \\( -name .git -o -name node_modules \\) -prune -o \\( -type f -o -type l \\) -print0 2>/dev/null | head -c 8000000; exit 0', "search", root], { on });
+    if (r.code !== 0) throw new Error(r.stderr || "Cannot search this folder");
+    paths = r.stdout.split("\0").map(p => p.replace(/^\.\//, ""));
+  }
+  paths = paths.filter(Boolean);
+  const out = paths.slice(0, INDEX_LIMIT).map(path => ({ path, lower: path.toLowerCase(), name: path.slice(path.lastIndexOf("/") + 1).toLowerCase() }));
+  out.limited = paths.length > INDEX_LIMIT;
+  return out;
+}
+
+// Every space-separated term must occur in the path (any letter case). Files whose name holds the terms come
+// first, a name that starts with the first term before that, then shorter paths, then A–Z.
+function search(index, query) {
+  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return [];
+  const scored = [];
+  for (const f of index) {
+    if (!terms.every(t => f.lower.includes(t))) continue;
+    const inName = terms.filter(t => f.name.includes(t)).length;
+    scored.push({ f, rank: (f.name.startsWith(terms[0]) ? 0 : 1) + (terms.length - inName) * 2 });
+  }
+  scored.sort((a, b) => a.rank - b.rank || a.f.path.length - b.f.path.length || a.f.path.localeCompare(b.f.path));
+  return scored.map(s => s.f.path);
+}
 
 async function directory(path, on) {
   const windowsDirectory = async () => {
@@ -115,6 +154,12 @@ export default class Files extends View {
     this.saved = new Map();
     this.sort = Math.max(0, SORTS.findIndex(s => s.id === storedSort()));
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {};
+    this.query = "";
+    this.input = InputState.new({ placeholder: "Search files…" });
+    this.input.on("change", (_e, cx) => { this.query = this.input.value().trim(); if (this.query) this.indexFiles(cx); cx.notify(); });
+    this.input.on("focus", (_e, cx) => { this.searching = true; cx.notify(); });
+    this.input.on("blur", (_e, cx) => { this.searching = false; cx.notify(); });
+    this.input.on("submit", (_e, cx) => { const first = this.results()[0]; if (first) this.show(first, cx); cx.notify(); });
     this.refresh(cx);
     cx.timer.every(10000, cx => this.refresh(cx));
   }
@@ -153,10 +198,16 @@ export default class Files extends View {
       this.context = { key: next, cwd, on }; this.root = cwd; this.on = on; this.entries = new Map(); this.folders = new Set(saved?.folders);
       this.pending = new Set(); this.marks = {}; this.show(null); this.watched = null; this.error = null; this.limited = false;
       this.loading = false;
+      // A new folder: its own file list, and the search starts empty.
+      this.index = null; this.indexing = false; this.searchError = null;
+      if (this.query) { this.query = ""; this.input.set_value(""); }
       if (saved?.file) this.show(saved.file, cx);
     }
     if (!cwd || this.loading) return;
     const context = this.context;
+    // Files changed (or 10 s passed): the search list is out of date. Kept on screen until the new one is read.
+    this.stale = true;
+    if (this.query) this.indexFiles(cx);
     this.loading = true;
     this.limited = false;
     cx.spawn(async cx => {
@@ -180,6 +231,47 @@ export default class Files extends View {
       } catch (e) { if (this.current(context)) this.error = String(e); }
       finally { if (this.context === context) this.loading = false; cx.notify(); }
     });
+  }
+
+  // Reads the folder's whole file list for search, once per folder and again after a refresh marks it stale.
+  indexFiles(cx) {
+    if (this.indexing || (this.index && !this.stale) || !this.root) return;
+    const context = this.context;
+    this.indexing = true; this.stale = false;
+    cx.spawn(async cx => {
+      try {
+        const index = await fileIndex(context.cwd, context.on);
+        if (this.current(context)) { this.index = index; this.searchError = null; this.matchCache = null; }
+      } catch (e) { if (this.current(context)) this.searchError = String(e); }
+      finally { if (this.context === context) this.indexing = false; cx.notify(); }
+    });
+  }
+
+  // Matches for the current query, kept until the query or the file list changes.
+  results() {
+    if (!this.query || !this.index) return [];
+    if (this.matchCache?.query !== this.query || this.matchCache.index !== this.index)
+      this.matchCache = { query: this.query, index: this.index, paths: search(this.index, this.query) };
+    return this.matchCache.paths;
+  }
+
+  resultRows(t) {
+    return this.results().slice(0, RESULTS).map(path => {
+      const cut = path.lastIndexOf("/"), name = path.slice(cut + 1), parent = cut > 0 ? path.slice(0, cut) : "";
+      const mark = this.marks[`${this.root}/${path}`];
+      return h_flex().id(`search-${path}`).h(28).flex_none().px(8).gap(7).items_center().rounded(7).cursor_pointer().hover(s => s.bg(t.hover))
+        .on_click((_e, cx) => this.show(path, cx))
+        .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.insertPath(path, cx); })
+        .child(svg("mods/better-files/file.svg").size(14).flex_none().text_color(t.muted))
+        .child(h_flex().flex_1().min_w(0).gap(6).items_center()
+          .child(div().flex_none().max_w_full().truncate().child(name))
+          .when(Boolean(parent), el => el.child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(parent))))
+        .when(Boolean(mark), el => el.child(div().text_size(11).text_color(mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked).child(mark)));
+    });
+  }
+
+  clearSearch(cx) {
+    this.query = ""; this.input.set_value(""); cx.notify();
   }
 
   toggle(path, cx) {
@@ -297,7 +389,28 @@ export default class Files extends View {
           .bg(t.hover).text_size(11).text_color(t.muted)
           .on_click((_e, cx) => { this.source = !this.source; cx.notify(); })
           .child(this.source ? "Preview" : "Source"))))
-      .when(!this.file, el => el.child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6).children(this.rows("", 0, [], t))
+      .when(!this.file, el => el.child(h_flex().id("better-files-search").h(30).flex_none().mx(8).mt(8).mb(2).px(9).gap(7).items_center()
+        .rounded(7).border_1().border_color(this.searching ? t.accent : t.border).bg(t.background).cursor_text()
+        .on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); this.input.focus(); })
+        .on_key_down((e, cx) => { if (e.key === "escape" && this.query) { cx.stop_propagation(); this.clearSearch(cx); } })
+        .child(svg("mods/better-files/search.svg").size(13).flex_none().text_color(t.dim))
+        .child(Input.new(this.input).flex_1().min_w(0).h_full().text_size(12).text_color(t.foreground))
+        .when(Boolean(this.query), el => el.child(div().id("better-files-clear").flex_none().px(4).rounded(4).cursor_pointer()
+          .text_size(13).text_color(t.dim).hover(s => s.text_color(t.foreground))
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+          .on_click((_e, cx) => this.clearSearch(cx)).child("×")))))
+      .when(!this.file && Boolean(this.query), el => {
+        const found = this.results();
+        const note = this.searchError ? this.searchError
+          : !this.index ? "Searching…"
+          : !found.length ? "No matching files"
+          : found.length > RESULTS ? `${RESULTS} of ${found.length.toLocaleString()} matches · type more to narrow`
+          : null;
+        return el.child(v_flex().id("better-files-results").flex_1().min_h(0).overflow_y_scrollbar().p(6).children(this.resultRows(t))
+          .when(Boolean(note), el => el.child(div().p(8).text_size(12).text_color(t.dim).child(note)))
+          .when(Boolean(this.index?.limited), el => el.child(div().p(8).text_size(11).text_color(t.dim).child(`Search covers the first ${INDEX_LIMIT.toLocaleString()} files`))));
+      })
+      .when(!this.file && !this.query, el => el.child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6).children(this.rows("", 0, [], t))
         .when(Boolean(this.error) || !this.entries.get("")?.length, el => el.child(div().p(8).text_size(12).text_color(t.dim).child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))))
         .when(this.limited, el => el.child(div().p(8).text_size(11).text_color(t.dim).child("File list limited to 500 entries per folder and 5,000 total")))))
       .when(Boolean(this.file), el => el.child(

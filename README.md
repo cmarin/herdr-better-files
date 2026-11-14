@@ -1,9 +1,10 @@
 # Better Files for Herdr
 
-A [Herdr](https://herdr.dev) desktop mod: the Files panel, with three additions.
+A [Herdr](https://herdr.dev) desktop mod: the Files panel, with four additions.
 
 - **Markdown that renders.** Click a `.md` file and it opens as a formatted document. A **Source** button in the header shows the raw text, and **Preview** switches back.
 - **Sorting.** A button in the header cycles the tree through **Name A–Z**, **Name Z–A**, **Newest** and **Oldest** (by modification time). Folders stay on top. The choice is remembered.
+- **Search.** A field at the top of the panel filters every file under the folder, not only the open folders. Type part of a name or path; each word you type must match. Files whose name matches come first. Click a result, or press Enter for the first one, to open it. Press Escape or click × to clear. In a git repository it uses `git ls-files`, so ignored files (`node_modules`, build output) are left out.
 - **Right-click to insert a path.** Right-click a file or folder and its absolute path is typed into the focused terminal, escaped the same as a Finder drop (`/a/my\ notes.md `), without pressing Enter. On macOS your clipboard is saved first and put back after.
 
 All other files open as before.
@@ -34,7 +35,7 @@ To undo, switch back to the `main` layout from the command palette.
 
 ## What it does and does not do
 
-- It reads files in the focused pane's folder, and runs `sh`, `stat` and `git` (and `powershell` on Windows) to list folders, read modification times and show git marks, the same as Herdr's own Files panel.
+- It reads files in the focused pane's folder, and runs `sh`, `stat` and `git` (and `powershell` on Windows) to list folders, read modification times and show git marks, the same as Herdr's own Files panel. Search runs `git ls-files` in a git repository, and `find` (or `powershell` on Windows) elsewhere.
 - Right-click runs Herdr's `terminal.paste` command. Before that, it puts the path on the clipboard: on macOS it runs `osascript` to save and restore the clipboard, on Linux `wl-copy` or `xclip` (one must be installed), and on Windows `Set-Clipboard`. On Linux and Windows the path stays on the clipboard.
 - On macOS the saved clipboard is kept in a private temporary folder (`$TMPDIR/herdr-better-files.XXXXXX`) for about half a second, then deleted. A clipboard that a password manager marks as concealed or transient is never written to disk; in that case the path stays on the clipboard.
 - It does not reach the network and does not write to your project.
@@ -43,4 +44,4 @@ To undo, switch back to the `main` layout from the command palette.
 
 ## License
 
-Apache-2.0. This mod is a modified copy of Herdr's shipped `files` mod (version 0.1.15, Apache-2.0, © Herdr). The changes: a rendered Markdown preview with a Source/Preview toggle, a sort button, and right-click path insertion. See `LICENSE`.
+Apache-2.0. This mod is a modified copy of Herdr's shipped `files` mod (version 0.1.15, Apache-2.0, © Herdr). The changes: a rendered Markdown preview with a Source/Preview toggle, a sort button, a search field, and right-click path insertion. See `LICENSE`.
