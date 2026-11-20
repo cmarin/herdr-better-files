@@ -4,7 +4,7 @@ A [Herdr](https://herdr.dev) desktop mod: the Files panel, with four additions.
 
 - **Markdown that renders.** Click a `.md` file and it opens as a formatted document. A **Source** button in the header shows the raw text, and **Preview** switches back.
 - **Sorting.** A button in the header cycles the tree through **Name A–Z**, **Name Z–A**, **Newest** and **Oldest** (by modification time). Folders stay on top. The choice is remembered.
-- **Search.** A field at the top of the panel filters every file under the folder, not only the open folders. Type part of a name or path; each word you type must match. Files whose name matches come first. Click a result, or press Enter for the first one, to open it. Press Escape or click × to clear. In a git repository it uses `git ls-files`, so ignored files (`node_modules`, build output) are left out.
+- **Search.** A field at the top of the panel filters every file under the folder, not only the open folders. Type part of a name or path; each word you type must match. Files whose name matches come first. Click a result, or press Enter for the first one, to open it. Press Escape or click × to clear. In a git repository it uses `git ls-files`, so ignored untracked files (`node_modules`, build output) and unstaged deletions are left out.
 - **Right-click to insert a path.** Right-click a file or folder and its absolute path is typed into the focused terminal, escaped the same as a Finder drop (`/a/my\ notes.md `), without pressing Enter. On macOS your clipboard is saved first and put back after.
 
 All other files open as before.
@@ -41,6 +41,10 @@ To undo, switch back to the `main` layout from the command palette.
 - It does not reach the network and does not write to your project.
 
 `RECIPE.md` describes the mod in full, so that an agent can rebuild it from scratch.
+
+## Checks
+
+Run `node --test` for the Git search regression and `herdr-app check mods/better-files` to validate the mod with Herdr.
 
 ## License
 
