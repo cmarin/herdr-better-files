@@ -83,12 +83,16 @@ const storedSort = () => { try { return localStorage.getItem("sort"); } catch { 
 const INDEX_LIMIT = 50000, RESULTS = 200;
 
 // Every file under `root`, as paths relative to it. In a git work tree: tracked and untracked files, without
-// ignored ones (node_modules, build output). Elsewhere: `find`, skipping .git and node_modules folders.
+// ignored untracked paths or unstaged deletions. Elsewhere: `find`, skipping .git and node_modules folders.
 async function fileIndex(root, on) {
-  const git = await exec("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], { cwd: root, on }).catch(() => null);
+  const git = await exec("git", ["ls-files", "-z", "-t", "--cached", "--deleted", "--others", "--exclude-standard"], { cwd: root, on }).catch(() => null);
   let paths;
-  if (git?.code === 0) paths = git.stdout.split("\0");
-  else if (!on && window()?.platform === "windows") {
+  if (git?.code === 0) {
+    // A missing tracked path is listed twice: cached and tagged "R " for deleted.
+    const entries = git.stdout.split("\0").filter(Boolean);
+    const deleted = new Set(entries.filter(e => e.startsWith("R ")).map(e => e.slice(2)));
+    paths = entries.map(e => e.slice(2)).filter(path => !deleted.has(path));
+  } else if (!on && window()?.platform === "windows") {
     const r = await exec("powershell", ["-NoProfile", "-Command", "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & { param($p) Get-ChildItem -LiteralPath $p -Recurse -File -Force -Name -ErrorAction SilentlyContinue | Where-Object { $_ -notmatch '(^|\\\\)(\\.git|node_modules)(\\\\|$)' } | Select-Object -First " + INDEX_LIMIT + " } '" + root.replace(/['‘’‚‛]/g, "$&$&") + "'"], { on });
     if (r.code !== 0) throw new Error(r.stderr || "Cannot search this folder");
     paths = r.stdout.split(/\r?\n/).map(p => p.replace(/\\/g, "/"));
